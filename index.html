@@ -258,19 +258,30 @@
       MONEDAS.forEach(function (m) { POR_CODIGO[m.code] = m; });
       const flagUrl = function (f) { return "https://flagcdn.com/w80/" + f + ".png"; };
 
-      const CACHE_KEY = "conversor_latam_v2";
-      const CACHE_TTL_MS = 60 * 60 * 1000;   // 1 hora
+      const CACHE_KEY = "conversor_latam_v3";
+      const CACHE_TTL_MS = 30 * 60 * 1000;   // 30 minutos
       const TIMEOUT_MS = 8000;
 
-      // Fuentes en orden de prioridad (sin API key)
-      const SOURCES = [
-        { name: "fawazahmed0 (jsDelivr)",   url: "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json", parse: parseFawaz },
-        { name: "fawazahmed0 (Cloudflare)", url: "https://latest.currency-api.pages.dev/v1/currencies/usd.json",                     parse: parseFawaz },
-        { name: "open.er-api.com",          url: "https://open.er-api.com/v6/latest/USD", parse: function (json) {
-            if (json.result !== "success" || !json.rates) throw new Error("Respuesta inválida");
-            return { rates: filtrar(json.rates, false), date: json.time_last_update_utc ? new Date(json.time_last_update_utc).toISOString().slice(0, 10) : "" };
-        } }
-      ];
+      // Fuentes sin API key. Se pide la URL con la fecha del día porque la
+      // versión "@latest" de jsDelivr puede quedarse en caché hasta 24 horas.
+      // Se consultan todas a la vez y se usa la que traiga la fecha más reciente.
+      function fechaUTC(diasAtras) {
+        return new Date(Date.now() - diasAtras * 86400000).toISOString().slice(0, 10);
+      }
+      function fuentes() {
+        const hoy = fechaUTC(0), ayer = fechaUTC(1);
+        return [
+          { name: "fawazahmed0",     url: "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@" + hoy + "/v1/currencies/usd.json", parse: parseFawaz },
+          { name: "fawazahmed0",     url: "https://" + hoy + ".currency-api.pages.dev/v1/currencies/usd.json", parse: parseFawaz },
+          { name: "fawazahmed0",     url: "https://latest.currency-api.pages.dev/v1/currencies/usd.json", parse: parseFawaz },
+          { name: "open.er-api.com", url: "https://open.er-api.com/v6/latest/USD", parse: parseEr },
+          { name: "fawazahmed0",     url: "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@" + ayer + "/v1/currencies/usd.json", parse: parseFawaz }
+        ];
+      }
+      function parseEr(json) {
+        if (json.result !== "success" || !json.rates) throw new Error("Respuesta inválida");
+        return { rates: filtrar(json.rates, false), date: json.time_last_update_utc ? new Date(json.time_last_update_utc).toISOString().slice(0, 10) : "" };
+      }
 
       function filtrar(raw, lower) {
         const out = {};
@@ -309,16 +320,20 @@
         } finally { clearTimeout(t); }
       }
       async function obtenerTasas() {
-        let err = null;
-        for (const src of SOURCES) {
-          try {
-            const p = src.parse(await fetchConTimeout(src.url));
-            const faltan = MONEDAS.filter(function (m) { return !p.rates[m.code]; });
-            if (faltan.length > 3) throw new Error("Faltan monedas");
-            return { rates: p.rates, date: p.date, source: src.name, savedAt: Date.now() };
-          } catch (e) { err = e; console.warn("Fuente falló:", src.name, e && e.message); }
-        }
-        throw err || new Error("Sin fuentes disponibles");
+        const lista = fuentes();
+        const resultados = await Promise.allSettled(lista.map(async function (src) {
+          const p = src.parse(await fetchConTimeout(src.url));
+          const faltan = MONEDAS.filter(function (m) { return !p.rates[m.code]; });
+          if (faltan.length > 3) throw new Error("Faltan monedas");
+          return { rates: p.rates, date: p.date, source: src.name, savedAt: Date.now() };
+        }));
+        let mejor = null;
+        resultados.forEach(function (r, i) {
+          if (r.status !== "fulfilled") { console.warn("Fuente falló:", lista[i].url, r.reason && r.reason.message); return; }
+          if (!mejor || (r.value.date || "") > (mejor.date || "")) mejor = r.value;
+        });
+        if (!mejor) throw new Error("Sin fuentes disponibles");
+        return mejor;
       }
 
       // ---------- Formato ----------
@@ -448,12 +463,14 @@
 
       function setStatus(tipo, texto) { statusEl.className = "status " + tipo; statusText.textContent = texto; }
       function describir(d, extra) {
-        return (d.date ? "Tasas del " + d.date : "Tasas cargadas") + " · " + d.source + (extra ? " · " + extra : "");
+        const fecha = d.date ? "Tasas del " + d.date.split("-").reverse().join("/") : "Tasas cargadas";
+        const hora = d.savedAt ? new Date(d.savedAt).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" }) : "";
+        return fecha + " · " + d.source + (hora ? " · consultado " + hora : "") + (extra ? " · " + extra : "");
       }
 
       async function cargar(forzar) {
         const cache = leer(CACHE_KEY);
-        const fresca = cache && cache.rates && (Date.now() - cache.savedAt < CACHE_TTL_MS);
+        const fresca = cache && cache.rates && (Date.now() - cache.savedAt < CACHE_TTL_MS) && (cache.date || "") >= fechaUTC(0);
         if (cache && cache.rates && !rates) {
           rates = cache.rates;
           actualizarTodo(false);
@@ -470,8 +487,7 @@
           escribir(CACHE_KEY, data);
           ultimoValor = 0;
           actualizarTodo(true);
-          const principal = data.source.indexOf("fawazahmed0") === 0;
-          setStatus(principal ? "ok" : "warn", describir(data, principal ? "" : "fuente de respaldo"));
+          setStatus("ok", describir(data, ""));
         } catch (e) {
           if (rates) setStatus("warn", describir(cache || { source: "caché" }, "sin conexión, usando datos guardados"));
           else { setStatus("error", "No se pudieron cargar las tasas. Revisa tu conexión e inténtalo de nuevo."); resTo.textContent = "—"; }
@@ -496,6 +512,9 @@
       $("refresh").addEventListener("click", function () { cargar(true); });
 
       cargar(false);
+      // Mantiene las tasas al día si la página queda abierta o el usuario vuelve a ella
+      setInterval(function () { cargar(false); }, 10 * 60 * 1000);
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) cargar(false); });
     })();
   </script>
 </body>
